@@ -1,0 +1,222 @@
+# Sync & Release
+#
+# Builds and publishes a release of this fork, with the compiled jar attached, when:
+#   - Upstream (PlayPro/CoreProtect) publishes a new release (checked daily).
+#   - Changes are pushed or merged into the default branch of this fork.
+#   - The workflow is started manually.
+#
+# Each run:
+#   1. Merges the latest upstream release tag into the fork branch.
+#   2. Builds the project and runs the tests.
+#   3. Pushes the merge and publishes the release for that upstream tag.
+#
+# There is one release per upstream version. Its tag and title follow upstream, and it is
+# replaced by each newer build of the same version, so it always contains the latest changes
+# of this fork. The jar keeps the filename produced by the project's Maven build.
+#
+# If the merge conflicts with changes in this fork, the run fails and the
+# conflict has to be resolved manually.
+
+name: Sync & Release
+
+on:
+  schedule:
+    - cron: '17 0 * * *'   # Daily at 00:17 UTC (offset from the hour to avoid scheduler delays)
+  push:
+    branches: [master]     # Default branch of this fork
+    # A push is skipped only when every changed file matches one of these patterns.
+    # Files that do not affect the compiled jar (documentation, CI configuration, repository metadata).
+    paths-ignore:
+      - '.github/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements.txt'
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Allow only one run at a time so scheduled, pushed and manual runs cannot overlap.
+concurrency:
+  group: sync-and-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: PlayPro/CoreProtect
+  JAVA_VERSION: '25'      # Must match the JDK used by upstream (see its build.yml / pom.xml)
+
+defaults:
+  run:
+    shell: bash           # Enables pipefail
+
+jobs:
+  # Determines the latest upstream release and whether a build is required.
+  # Scheduled runs only build when the fork has not released that version yet.
+  # Pushes and manual runs always build.
+  check:
+    name: Check upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      needed: ${{ steps.latest.outputs.needed }}
+    steps:
+      - name: Determine latest upstream release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name // empty')
+
+          # The tag is used in git and shell commands later, so restrict it to safe characters.
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Unexpected or missing upstream tag: '$TAG'"
+            exit 1
+          fi
+
+          NEEDED=true
+          if [ "$EVENT_NAME" = "schedule" ] \
+            && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            NEEDED=false
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG | trigger: $EVENT_NAME | build needed: $NEEDED" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Merges the upstream release, runs the build and tests, then publishes the release.
+  release:
+    name: Merge, test & release
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      # The merge is only committed locally at this point.
+      # It is pushed after the tests pass, so a failing build never leaves a broken merge on the branch.
+      - name: Merge upstream release (local)
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$TAG"
+          UP_SHA=$(git rev-parse FETCH_HEAD)
+
+          MERGED=false
+          if git merge-base --is-ancestor "$UP_SHA" HEAD; then
+            echo "Fork already contains upstream $TAG"
+          else
+            git merge --no-commit --no-ff "$UP_SHA" || true
+
+            # Keep the fork's own workflow files.
+            # GITHUB_TOKEN cannot push workflow changes, and upstream's workflows must not replace them.
+            git rm -rfq --ignore-unmatch .github/workflows
+            git checkout HEAD -- .github/workflows
+
+            if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              echo "::error::Merge with upstream $TAG could not be started"
+              exit 1
+            fi
+
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            if [ -n "$CONFLICTS" ]; then
+              echo "::error::Merge conflict with upstream $TAG in: $CONFLICTS"
+              exit 1
+            fi
+
+            git commit -qm "Merge upstream $TAG"
+            MERGED=true
+          fi
+
+          echo "merged=$MERGED" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # Compiles the project and runs the tests. Later steps are skipped if this fails.
+      - name: Build and test
+        run: mvn -B verify
+
+      - name: Push merge to fork
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin "HEAD:$GITHUB_REF_NAME"
+
+      # The release title is taken from the upstream release (for example "CoreProtect CE v24.1").
+      # The jar keeps the filename produced by the Maven build.
+      - name: Prepare release files
+        id: prep
+        env:
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          FORK_SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          JAR=$(find target -maxdepth 1 -type f -name '*.jar' \
+            ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n1)
+          [ -n "$JAR" ] || { echo "::error::No jar found in target/"; exit 1; }
+
+          TITLE=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.name // empty' | tr -d '\r\n')
+          TITLE=${TITLE:-$TAG}
+
+          # Describe the build accurately: identical to upstream, or including changes from this fork.
+          UPSTREAM_URL="https://github.com/$UPSTREAM/releases/tag/$TAG"
+          if git diff --quiet "$UPSTREAM_SHA" HEAD -- . ':(exclude).github'; then
+            SOURCE="Build of upstream release [\`$TAG\`]($UPSTREAM_URL)."
+          else
+            SOURCE="Build of upstream release [\`$TAG\`]($UPSTREAM_URL), including the changes merged into this fork."
+          fi
+
+          {
+            echo "$SOURCE"
+            echo
+            echo "The changelog is available on the upstream release page."
+            echo
+            echo "Commit [\`${FORK_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$FORK_SHA) · [Build log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · Java $JAVA_VERSION (Temurin) · $(date -u '+%Y-%m-%d %H:%M UTC')"
+          } > "$RUNNER_TEMP/notes.md"
+
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Release asset: $(basename "$JAR")"
+
+      # Removes the previous release of this version, if any, so it can be replaced by the new build.
+      # Also removes a leftover tag (for example one copied from upstream) so the new tag is created
+      # on the commit that was built.
+      - name: Remove previous release and tag (if present)
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+
+      - name: Publish release
+        id: publish
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG }}
+          commit: ${{ steps.merge.outputs.sha }}
+          name: ${{ steps.prep.outputs.title }}
+          bodyFile: ${{ runner.temp }}/notes.md
+          artifacts: ${{ steps.prep.outputs.jar }}
+          makeLatest: true
+          token: ${{ github.token }}
+
+      - name: Summary
+        run: echo "Released [$TAG](${{ steps.publish.outputs.html_url }})" >> "$GITHUB_STEP_SUMMARY"
