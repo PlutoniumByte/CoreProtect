@@ -1,27 +1,30 @@
 # Sync & Release
 #
-# Builds and publishes a release of this fork, with the compiled jar attached, when:
-#   - Upstream (PlayPro/CoreProtect) publishes a new release (checked daily).
+# Builds and publishes a GitHub release of this fork, with the compiled jar attached, when:
+#   - Upstream (PlayPro/CoreProtect) publishes a new release (checked hourly).
 #   - Changes are pushed or merged into the default branch of this fork.
 #   - The workflow is started manually.
 #
-# Each run:
-#   1. Merges the latest upstream release tag into the fork branch.
-#   2. Builds the project and runs the tests.
-#   3. Pushes the merge and publishes the release for that upstream tag.
+# The build source is the upstream release tag. Changes made in this fork (the difference between
+# the fork's branch and upstream's default branch, ignoring .github) are applied on top of it.
+# Without such changes the build is identical to the upstream release.
+# When changes are applied, they are attached to the release as fork-changes.patch.
+#
+# Upstream release tags are not always part of the history of its default branch, so the tag is
+# not merged into the fork's branch. This workflow never modifies the fork's branch.
 #
 # There is one release per upstream version. Its tag and title follow upstream, and it is
-# replaced by each newer build of the same version, so it always contains the latest changes
-# of this fork. The jar keeps the filename produced by the project's Maven build.
+# replaced by each newer build of the same version.
+# The jar is named <JAR_NAME_PREFIX>-<tag>.jar, for example CoreProtect-CE-v24.1.jar.
 #
-# If the merge conflicts with changes in this fork, the run fails and the
+# If the fork's changes do not apply to the upstream release, the run fails and the
 # conflict has to be resolved manually.
 
 name: Sync & Release
 
 on:
   schedule:
-    - cron: '17 0 * * *'   # Daily at 00:17 UTC (offset from the hour to avoid scheduler delays)
+    - cron: '17 * * * *'   # Hourly, at minute 17 (offset from the hour to avoid scheduler delays)
   push:
     branches: [master]     # Default branch of this fork
     # A push is skipped only when every changed file matches one of these patterns.
@@ -47,6 +50,7 @@ concurrency:
 env:
   UPSTREAM: PlayPro/CoreProtect
   JAVA_VERSION: '25'      # Must match the JDK used by upstream (see its build.yml / pom.xml)
+  JAR_NAME_PREFIX: CoreProtect-CE
 
 defaults:
   run:
@@ -88,9 +92,9 @@ jobs:
           echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
           echo "Upstream latest: $TAG | trigger: $EVENT_NAME | build needed: $NEEDED" | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Merges the upstream release, runs the build and tests, then publishes the release.
+  # Builds the upstream release (plus any changes of this fork), runs the tests, then publishes it.
   release:
-    name: Merge, test & release
+    name: Build & release
     needs: check
     if: needs.check.outputs.needed == 'true'
     runs-on: ubuntu-latest
@@ -107,46 +111,54 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      # The merge is only committed locally at this point.
-      # It is pushed after the tests pass, so a failing build never leaves a broken merge on the branch.
-      - name: Merge upstream release (local)
-        id: merge
+      # Collects the changes of this fork (relative to upstream's default branch), then switches the
+      # working tree to the upstream release tag and applies them. Nothing is pushed.
+      - name: Prepare source (upstream release plus fork changes)
+        id: source
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          FORK_SHA=$(git rev-parse HEAD)
 
+          DEFAULT_BRANCH=$(gh api "repos/$UPSTREAM" --jq '.default_branch')
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/upstream/$DEFAULT_BRANCH"
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$TAG"
-          UP_SHA=$(git rev-parse FETCH_HEAD)
+          TAG_SHA=$(git rev-parse "FETCH_HEAD^{commit}")
 
-          MERGED=false
-          if git merge-base --is-ancestor "$UP_SHA" HEAD; then
-            echo "Fork already contains upstream $TAG"
-          else
-            git merge --no-commit --no-ff "$UP_SHA" || true
+          BASE=$(git merge-base HEAD "refs/remotes/upstream/$DEFAULT_BRANCH") || {
+            echo "::error::This fork shares no history with upstream's $DEFAULT_BRANCH branch"
+            exit 1
+          }
 
-            # Keep the fork's own workflow files.
-            # GITHUB_TOKEN cannot push workflow changes, and upstream's workflows must not replace them.
-            git rm -rfq --ignore-unmatch .github/workflows
-            git checkout HEAD -- .github/workflows
+          PATCH="$RUNNER_TEMP/fork-changes.patch"
+          git diff --binary "$BASE" HEAD -- . ':(exclude).github' > "$PATCH"
 
-            if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-              echo "::error::Merge with upstream $TAG could not be started"
+          git checkout -q --detach "$TAG_SHA"
+
+          MODIFIED=false
+          if [ -s "$PATCH" ]; then
+            if ! git apply --3way --index "$PATCH"; then
+              echo "::error::The changes of this fork do not apply cleanly to upstream $TAG"
+              git diff --name-only --diff-filter=U | sed 's/^/::error::Conflict in /'
               exit 1
             fi
-
-            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
-            if [ -n "$CONFLICTS" ]; then
-              echo "::error::Merge conflict with upstream $TAG in: $CONFLICTS"
-              exit 1
-            fi
-
-            git commit -qm "Merge upstream $TAG"
-            MERGED=true
+            MODIFIED=true
           fi
 
-          echo "merged=$MERGED" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+          # The release tag should point at the upstream commit. If it is not reachable from this
+          # repository, fall back to the fork's own commit.
+          if gh api "repos/$GITHUB_REPOSITORY/commits/$TAG_SHA" --silent >/dev/null 2>&1; then
+            TARGET=$TAG_SHA
+          else
+            TARGET=$FORK_SHA
+          fi
+
+          {
+            echo "fork_sha=$FORK_SHA"
+            echo "tag_sha=$TAG_SHA"
+            echo "target=$TARGET"
+            echo "modified=$MODIFIED"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source: upstream $TAG ($TAG_SHA) | fork changes applied: $MODIFIED"
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v6
@@ -159,31 +171,36 @@ jobs:
       - name: Build and test
         run: mvn -B verify
 
-      - name: Push merge to fork
-        if: steps.merge.outputs.merged == 'true'
-        run: git push origin "HEAD:$GITHUB_REF_NAME"
-
       # The release title is taken from the upstream release (for example "CoreProtect CE v24.1").
-      # The jar keeps the filename produced by the Maven build.
+      # The jar is renamed to <JAR_NAME_PREFIX>-<tag>.jar.
       - name: Prepare release files
         id: prep
         env:
-          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
-          FORK_SHA: ${{ steps.merge.outputs.sha }}
+          FORK_SHA: ${{ steps.source.outputs.fork_sha }}
+          TAG_SHA: ${{ steps.source.outputs.tag_sha }}
+          MODIFIED: ${{ steps.source.outputs.modified }}
         run: |
           JAR=$(find target -maxdepth 1 -type f -name '*.jar' \
-            ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n1)
+            ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)
           [ -n "$JAR" ] || { echo "::error::No jar found in target/"; exit 1; }
+
+          ASSET="$JAR_NAME_PREFIX-$TAG.jar"
+          DIST="$RUNNER_TEMP/dist"
+          mkdir -p "$DIST"
+          cp "$JAR" "$DIST/$ASSET"
+          ARTIFACTS="$DIST/$ASSET"
 
           TITLE=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.name // empty' | tr -d '\r\n')
           TITLE=${TITLE:-$TAG}
 
-          # Describe the build accurately: identical to upstream, or including changes from this fork.
-          UPSTREAM_URL="https://github.com/$UPSTREAM/releases/tag/$TAG"
-          if git diff --quiet "$UPSTREAM_SHA" HEAD -- . ':(exclude).github'; then
-            SOURCE="Build of upstream release [\`$TAG\`]($UPSTREAM_URL)."
+          UPSTREAM_URL="$GITHUB_SERVER_URL/$UPSTREAM"
+          SOURCE="Build of upstream release [\`$TAG\`]($UPSTREAM_URL/releases/tag/$TAG) (commit [\`${TAG_SHA:0:7}\`]($UPSTREAM_URL/commit/$TAG_SHA))"
+          if [ "$MODIFIED" = "true" ]; then
+            cp "$RUNNER_TEMP/fork-changes.patch" "$DIST/fork-changes.patch"
+            ARTIFACTS="$ARTIFACTS,$DIST/fork-changes.patch"
+            SOURCE="$SOURCE with the changes of this fork applied. The changes are attached as \`fork-changes.patch\` (fork commit [\`${FORK_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$FORK_SHA))."
           else
-            SOURCE="Build of upstream release [\`$TAG\`]($UPSTREAM_URL), including the changes merged into this fork."
+            SOURCE="$SOURCE."
           fi
 
           {
@@ -191,12 +208,12 @@ jobs:
             echo
             echo "The changelog is available on the upstream release page."
             echo
-            echo "Commit [\`${FORK_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$FORK_SHA) · [Build log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · Java $JAVA_VERSION (Temurin) · $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "[Build log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · Java $JAVA_VERSION (Temurin) · $(date -u '+%Y-%m-%d %H:%M UTC')"
           } > "$RUNNER_TEMP/notes.md"
 
-          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
-          echo "Release asset: $(basename "$JAR")"
+          echo "Release asset: $ASSET (built from $(basename "$JAR"))"
 
       # Removes the previous release of this version, if any, so it can be replaced by the new build.
       # Also removes a leftover tag (for example one copied from upstream) so the new tag is created
@@ -211,10 +228,10 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.TAG }}
-          commit: ${{ steps.merge.outputs.sha }}
+          commit: ${{ steps.source.outputs.target }}
           name: ${{ steps.prep.outputs.title }}
           bodyFile: ${{ runner.temp }}/notes.md
-          artifacts: ${{ steps.prep.outputs.jar }}
+          artifacts: ${{ steps.prep.outputs.artifacts }}
           makeLatest: true
           token: ${{ github.token }}
 
